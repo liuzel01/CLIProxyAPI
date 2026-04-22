@@ -1,9 +1,16 @@
 package configaccess
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -89,15 +96,25 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 		if candidate.value == "" {
 			continue
 		}
-		if _, ok := p.keys[candidate.value]; ok {
-			return &sdkaccess.Result{
-				Provider:  p.Identifier(),
-				Principal: candidate.value,
-				Metadata: map[string]string{
-					"source": candidate.source,
-				},
-			}, nil
+		if _, ok := p.keys[candidate.value]; !ok {
+			continue
 		}
+
+		policyMeta, policyErr := validateTokenPolicy(r, candidate.value)
+		if policyErr != nil {
+			return nil, policyErr
+		}
+
+		metadata := map[string]string{"source": candidate.source}
+		for k, v := range policyMeta {
+			metadata[k] = v
+		}
+
+		return &sdkaccess.Result{
+			Provider:  p.Identifier(),
+			Principal: candidate.value,
+			Metadata:  metadata,
+		}, nil
 	}
 
 	return nil, sdkaccess.NewInvalidCredentialError()
@@ -138,4 +155,240 @@ func normalizeKeys(keys []string) []string {
 		return nil
 	}
 	return normalized
+}
+
+type tokenPolicy struct {
+	ID            string   `json:"id"`
+	Token         string   `json:"token"`
+	Owner         string   `json:"owner"`
+	Purpose       string   `json:"purpose,omitempty"`
+	AllowedModels []string `json:"allowed_models,omitempty"`
+	AllowedScopes []string `json:"allowed_scopes,omitempty"`
+	ExpiresAt     string   `json:"expires_at,omitempty"`
+	Status        string   `json:"status"`
+}
+
+type tokenPolicyFile struct {
+	Version int           `json:"version"`
+	Tokens  []tokenPolicy `json:"tokens"`
+}
+
+var policyCache struct {
+	sync.RWMutex
+	path    string
+	modTime time.Time
+	data    tokenPolicyFile
+}
+
+func validateTokenPolicy(r *http.Request, key string) (map[string]string, *sdkaccess.AuthError) {
+	policies, loaded, err := loadPolicyFile()
+	if err != nil {
+		return nil, sdkaccess.NewInvalidCredentialError()
+	}
+	if !loaded {
+		// Compatibility mode: no policy file means no policy enforcement yet.
+		return nil, nil
+	}
+
+	var matched *tokenPolicy
+	for i := range policies.Tokens {
+		if policies.Tokens[i].Token == key {
+			matched = &policies.Tokens[i]
+			break
+		}
+	}
+	if matched == nil {
+		// Compatibility mode: unmanaged keys continue to work.
+		return nil, nil
+	}
+
+	status := strings.ToLower(strings.TrimSpace(matched.Status))
+	if status == "" {
+		status = "active"
+	}
+	if status != "active" {
+		return nil, sdkaccess.NewInvalidCredentialError()
+	}
+
+	if strings.TrimSpace(matched.ExpiresAt) != "" {
+		expiresAt, parseErr := time.Parse(time.RFC3339, strings.TrimSpace(matched.ExpiresAt))
+		if parseErr != nil || time.Now().After(expiresAt) {
+			return nil, sdkaccess.NewInvalidCredentialError()
+		}
+	}
+
+	if len(matched.AllowedScopes) > 0 && !scopeAllowed(matched.AllowedScopes, r) {
+		return nil, sdkaccess.NewInvalidCredentialError()
+	}
+
+	if len(matched.AllowedModels) > 0 {
+		model, modelErr := extractRequestModel(r)
+		if modelErr != nil {
+			return nil, sdkaccess.NewInvalidCredentialError()
+		}
+		if strings.TrimSpace(model) == "" || !inStringSliceCI(matched.AllowedModels, model) {
+			return nil, sdkaccess.NewInvalidCredentialError()
+		}
+	}
+
+	meta := map[string]string{"tokenPolicyManaged": "true"}
+	if strings.TrimSpace(matched.ID) != "" {
+		meta["tokenPolicyId"] = strings.TrimSpace(matched.ID)
+	}
+	if strings.TrimSpace(matched.Owner) != "" {
+		meta["tokenOwner"] = strings.TrimSpace(matched.Owner)
+	}
+	if strings.TrimSpace(matched.Purpose) != "" {
+		meta["tokenPurpose"] = strings.TrimSpace(matched.Purpose)
+	}
+	return meta, nil
+}
+
+func scopeAllowed(scopes []string, r *http.Request) bool {
+	path := "/"
+	method := ""
+	if r != nil {
+		if r.URL != nil && strings.TrimSpace(r.URL.Path) != "" {
+			path = r.URL.Path
+		}
+		method = strings.ToUpper(strings.TrimSpace(r.Method))
+	}
+	for _, raw := range scopes {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		if s == "*" {
+			return true
+		}
+		if strings.EqualFold(s, "management") && strings.HasPrefix(path, "/v0/management") {
+			return true
+		}
+		if strings.HasSuffix(s, "*") {
+			prefix := strings.TrimSuffix(s, "*")
+			if strings.HasPrefix(path, prefix) {
+				return true
+			}
+			continue
+		}
+		if strings.Contains(s, " ") {
+			parts := strings.SplitN(s, " ", 2)
+			sm := strings.ToUpper(strings.TrimSpace(parts[0]))
+			sp := strings.TrimSpace(parts[1])
+			if sm == method && sp != "" && strings.HasPrefix(path, sp) {
+				return true
+			}
+			continue
+		}
+		if strings.HasPrefix(path, s) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractRequestModel(r *http.Request) (string, error) {
+	if r == nil {
+		return "", nil
+	}
+	if r.URL != nil {
+		if queryModel := strings.TrimSpace(r.URL.Query().Get("model")); queryModel != "" {
+			return queryModel, nil
+		}
+	}
+	if r.Body == nil {
+		return "", nil
+	}
+	buf, err := io.ReadAll(r.Body)
+	if err != nil {
+		return "", err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(buf))
+	if len(bytes.TrimSpace(buf)) == 0 {
+		return "", nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(buf, &payload); err != nil {
+		return "", nil
+	}
+	if raw, ok := payload["model"]; ok {
+		if model, ok := raw.(string); ok {
+			return strings.TrimSpace(model), nil
+		}
+	}
+	return "", nil
+}
+
+func inStringSliceCI(items []string, target string) bool {
+	t := strings.TrimSpace(target)
+	if t == "" {
+		return false
+	}
+	for _, item := range items {
+		if strings.EqualFold(strings.TrimSpace(item), t) {
+			return true
+		}
+	}
+	return false
+}
+
+func loadPolicyFile() (tokenPolicyFile, bool, error) {
+	path := policyPath()
+	if strings.TrimSpace(path) == "" {
+		return tokenPolicyFile{}, false, nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return tokenPolicyFile{}, false, nil
+		}
+		return tokenPolicyFile{}, false, err
+	}
+
+	policyCache.RLock()
+	if policyCache.path == path && !info.ModTime().After(policyCache.modTime) {
+		cached := policyCache.data
+		policyCache.RUnlock()
+		return cached, true, nil
+	}
+	policyCache.RUnlock()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return tokenPolicyFile{}, false, err
+	}
+	var parsed tokenPolicyFile
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return tokenPolicyFile{}, false, err
+	}
+
+	policyCache.Lock()
+	policyCache.path = path
+	policyCache.modTime = info.ModTime()
+	policyCache.data = parsed
+	policyCache.Unlock()
+
+	return parsed, true, nil
+}
+
+func policyPath() string {
+	if p := strings.TrimSpace(os.Getenv("CLI_PROXY_TOKEN_POLICY_PATH")); p != "" {
+		return p
+	}
+	baseDirCandidates := []string{}
+	if p := strings.TrimSpace(os.Getenv("CLI_PROXY_AUTH_PATH")); p != "" {
+		baseDirCandidates = append(baseDirCandidates, p)
+	}
+	baseDirCandidates = append(baseDirCandidates, "/root/.cli-proxy-api", "./auths")
+	for _, base := range baseDirCandidates {
+		if strings.TrimSpace(base) == "" {
+			continue
+		}
+		p := filepath.Join(base, "token-policies.json")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	// fallback write target (may not exist yet)
+	return filepath.Join("/root/.cli-proxy-api", "token-policies.json")
 }
