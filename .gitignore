@@ -52,4 +52,3 @@ _bmad-output/*
 ._*
 
 runtime/
-!docs/multi-tenant-stable-usage-plan.md
