@@ -50,3 +50,6 @@ _bmad-output/*
 # macOS
 .DS_Store
 ._*
+
+runtime/
+!docs/multi-tenant-stable-usage-plan.md
