@@ -20,8 +20,7 @@ compose_cmd() {
     echo "docker-compose"
     return 0
   fi
-  echo "[ERROR] neither 'docker compose' nor 'docker-compose' is available" >&2
-  exit 127
+  return 1
 }
 
 find_container() {
@@ -35,50 +34,80 @@ find_container() {
   return 1
 }
 
+container_running() {
+  local name="$1"
+  docker ps --format '{{.Names}}' | grep -qx "$name"
+}
+
 do_start() {
-  local cc
-  cc="$(compose_cmd)"
-  if [[ -f "$COMPOSE_FILE" ]]; then
-    (cd "$ROOT_DIR" && $cc up -d "$SERVICE_NAME")
-  else
-    echo "[WARN] compose file not found, trying docker start"
-    local name
-    name="$(find_container || true)"
-    if [[ -z "$name" ]]; then
-      echo "[ERROR] no known container found" >&2
-      exit 1
+  local name
+  name="$(find_container || true)"
+  if [[ -n "$name" ]]; then
+    if container_running "$name"; then
+      echo "[INFO] container already running: $name"
+      return
     fi
+    echo "[INFO] starting container: $name"
     docker start "$name"
+    return
   fi
+
+  local cc
+  cc="$(compose_cmd || true)"
+  if [[ -n "$cc" ]] && [[ -f "$COMPOSE_FILE" ]]; then
+    echo "[INFO] starting via compose service: $SERVICE_NAME"
+    (cd "$ROOT_DIR" && $cc up -d "$SERVICE_NAME")
+    return
+  fi
+
+  echo "[ERROR] no known container found and compose unavailable" >&2
+  exit 1
 }
 
 do_stop() {
-  local cc
-  cc="$(compose_cmd)"
-  if [[ -f "$COMPOSE_FILE" ]]; then
-    (cd "$ROOT_DIR" && $cc stop "$SERVICE_NAME")
-  else
-    local name
-    name="$(find_container || true)"
-    if [[ -z "$name" ]]; then
-      echo "[ERROR] no known container found" >&2
-      exit 1
+  local name
+  name="$(find_container || true)"
+  if [[ -n "$name" ]]; then
+    if container_running "$name"; then
+      echo "[INFO] stopping container: $name"
+      docker stop "$name"
+    else
+      echo "[INFO] container already stopped: $name"
     fi
-    docker stop "$name"
+    return
   fi
+
+  local cc
+  cc="$(compose_cmd || true)"
+  if [[ -n "$cc" ]] && [[ -f "$COMPOSE_FILE" ]]; then
+    echo "[INFO] stopping via compose service: $SERVICE_NAME"
+    (cd "$ROOT_DIR" && $cc stop "$SERVICE_NAME")
+    return
+  fi
+
+  echo "[ERROR] no known container found and compose unavailable" >&2
+  exit 1
 }
 
 do_restart() {
   local name
   name="$(find_container || true)"
   if [[ -n "$name" ]]; then
+    echo "[INFO] restarting container: $name"
     docker restart "$name"
     return
   fi
-  # fallback to compose restart if container name not found yet
+
   local cc
-  cc="$(compose_cmd)"
-  (cd "$ROOT_DIR" && $cc restart "$SERVICE_NAME")
+  cc="$(compose_cmd || true)"
+  if [[ -n "$cc" ]] && [[ -f "$COMPOSE_FILE" ]]; then
+    echo "[INFO] restarting via compose service: $SERVICE_NAME"
+    (cd "$ROOT_DIR" && $cc restart "$SERVICE_NAME")
+    return
+  fi
+
+  echo "[ERROR] no known container found and compose unavailable" >&2
+  exit 1
 }
 
 do_status() {
